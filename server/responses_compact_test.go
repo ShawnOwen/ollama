@@ -1021,3 +1021,55 @@ func TestResponsesForeignCompactionHistory(t *testing.T) {
 		})
 	}
 }
+
+// Codex histories saved by older releases can hold a prior summary output with
+// no synthetic call. Both compaction entry points used to reject them with 400
+// before inference, so every later turn on the thread failed.
+func TestResponsesCompactionRecoversOrphanedPriorSummary(t *testing.T) {
+	payload, err := json.Marshal(openai.OllamaCompactionPayload{
+		Type: openai.OllamaCompactionPayloadType, Version: openai.OllamaCompactionPayloadVersion,
+		Summary: "latest summary",
+		Retained: []api.Message{
+			{Role: "user", Content: "build the pipeline"},
+			{Role: "tool", ToolCallID: "call_ollama_compaction_2fa260fb1a51", Content: "orphaned prior summary"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := json.Marshal(map[string]any{"type": "compaction", "encrypted_content": string(payload)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, mode := range []struct {
+		name    string
+		path    string
+		trigger bool
+	}{
+		{"triggered", "/v1/responses", true},
+		{"standalone", "/v1/responses/compact", false},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			local, capture := newCompactionTestServer(t, func(_ int, w http.ResponseWriter, _ *http.Request, _ []byte) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write(summaryResponse(t, "Recovered summary.", nil))
+			})
+			input := string(item) + `,{"type":"message","role":"user","content":"hi"}`
+			if mode.trigger {
+				input += `,{"type":"compaction_trigger"}`
+			}
+			request := fmt.Sprintf(`{"model":"fixture:cloud","stream":%t,"input":[%s]}`, mode.trigger, input)
+			status, _, body := postCompactionRequest(t, local, mode.path, request)
+			if status != http.StatusOK {
+				t.Fatalf("status=%d body=%s", status, body)
+			}
+			if bytes.Contains(body, []byte("call_ollama_compaction_2fa260fb1a51")) {
+				t.Fatalf("orphaned summary output was retained: %s", body)
+			}
+			if paths, _ := capture.snapshot(); len(paths) != 1 {
+				t.Fatalf("summary inference calls=%v, want 1", paths)
+			}
+		})
+	}
+}

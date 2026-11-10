@@ -22,6 +22,7 @@ const (
 	OllamaCompactionPayloadVersion = 1
 	CreateSummaryToolName          = "create_summary"
 	compactionSummaryToolName      = "ollama_compaction_summary"
+	compactionSummaryCallIDPrefix  = "call_ollama_compaction_"
 	compactionOmissionNotice       = "Compaction warning: %d older transcript items were omitted before summarization because the model's context limit was exceeded."
 )
 
@@ -92,10 +93,13 @@ type ResponsesCompactionPlan struct {
 	Model  string
 	Stream bool
 
-	items        []CompactionTranscriptItem
-	tools        []compactionToolMetadata
-	groups       []compactionToolGroup
-	forcedRefs   map[string]struct{}
+	items      []CompactionTranscriptItem
+	tools      []compactionToolMetadata
+	groups     []compactionToolGroup
+	forcedRefs map[string]struct{}
+	// summaryRefs are prior Ollama summary items. A new compaction
+	// supersedes them, so they are never retained.
+	summaryRefs  map[string]struct{}
 	omittedItems int
 }
 
@@ -371,7 +375,7 @@ func payloadToResponsesItems(payload OllamaCompactionPayload) ([]json.RawMessage
 		return nil, err
 	}
 	hash := sha256.Sum256(b)
-	callID := "call_ollama_compaction_" + hex.EncodeToString(hash[:6])
+	callID := compactionSummaryCallIDPrefix + hex.EncodeToString(hash[:6])
 	args, _ := json.Marshal(map[string]any{"version": payload.Version})
 
 	items := make([]json.RawMessage, 0, 2+len(payload.Retained))
@@ -547,6 +551,7 @@ func newResponsesCompactionPlan(req rawResponsesRequest, rawItems []json.RawMess
 	stream := req.Stream != nil && *req.Stream
 	return &ResponsesCompactionPlan{
 		Model: req.Model, Stream: stream, items: items, tools: collectCompactionToolMetadata(req.Tools), groups: groups, forcedRefs: forced,
+		summaryRefs: priorSummaryRefs(items),
 	}, nil
 }
 
@@ -640,7 +645,7 @@ func analyzeCompactionToolState(items []CompactionTranscriptItem) ([]compactionT
 			if call.ID == "" {
 				return nil, nil, fmt.Errorf("%s: function call is missing call_id", item.Ref)
 			}
-			if call.Function.Name == compactionSummaryToolName && strings.HasPrefix(call.ID, "call_ollama_compaction_") {
+			if call.Function.Name == compactionSummaryToolName && isPriorSummaryCallID(call.ID) {
 				ignoredCallIDs[call.ID] = struct{}{}
 				continue
 			}
@@ -662,6 +667,12 @@ func analyzeCompactionToolState(items []CompactionTranscriptItem) ([]compactionT
 				continue
 			}
 			group := byCallID[callID]
+			if group == nil && isPriorSummaryCallID(callID) {
+				// Older Ollama releases could retain a prior summary output
+				// without its synthetic call. Tolerate it so the history can
+				// still be compacted; Complete drops it from the new payload.
+				continue
+			}
 			if group == nil {
 				return nil, nil, fmt.Errorf("%s: function output has no matching call %q", item.Ref, callID)
 			}
@@ -694,6 +705,32 @@ func analyzeCompactionToolState(items []CompactionTranscriptItem) ([]compactionT
 		}
 	}
 	return groups, forced, nil
+}
+
+// isPriorSummaryCallID reports whether callID names a synthetic Ollama
+// summary pair emitted by payloadToResponsesItems.
+func isPriorSummaryCallID(callID string) bool {
+	return strings.HasPrefix(callID, compactionSummaryCallIDPrefix)
+}
+
+// priorSummaryRefs returns the refs of synthetic summary calls and outputs,
+// including outputs whose synthetic call is missing.
+func priorSummaryRefs(items []CompactionTranscriptItem) map[string]struct{} {
+	refs := make(map[string]struct{})
+	for _, item := range items {
+		switch item.Type {
+		case "function_call":
+			call := item.Message.ToolCalls[0]
+			if call.Function.Name == compactionSummaryToolName && isPriorSummaryCallID(call.ID) {
+				refs[item.Ref] = struct{}{}
+			}
+		case "function_call_output":
+			if isPriorSummaryCallID(item.Message.ToolCallID) {
+				refs[item.Ref] = struct{}{}
+			}
+		}
+	}
+	return refs
 }
 
 func collectCompactionToolMetadata(tools []ResponsesTool) []compactionToolMetadata {
@@ -931,6 +968,12 @@ func (p *ResponsesCompactionPlan) Complete(body []byte) (ResponsesCompactionResu
 				selected[group.ResultRef] = struct{}{}
 			}
 		}
+	}
+	// Prior summaries are carried forward by the new summary. Retaining one
+	// nests summaries, and retaining only its output leaves a result with no
+	// call, which makes every later compaction fail validation.
+	for ref := range p.summaryRefs {
+		delete(selected, ref)
 	}
 
 	retained := make([]api.Message, 0, len(selected))
