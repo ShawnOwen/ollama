@@ -226,3 +226,36 @@ func TestCompactionStillRejectsOrdinaryOrphanedToolOutputs(t *testing.T) {
 		}
 	}
 }
+
+// A client tool call whose own call_id happens to use the summary prefix keeps
+// its output when retained.
+func TestCompactionKeepsOrdinaryToolPairWithSummaryLikeCallID(t *testing.T) {
+	callID := summaryCallIDPrefix + "clientchosen"
+	body := compactionBody(t, true,
+		map[string]any{"type": "message", "role": "user", "content": "run it"},
+		map[string]any{"type": "function_call", "call_id": callID, "name": "exec", "arguments": "{}"},
+		map[string]any{"type": "function_call_output", "call_id": callID, "output": "done"},
+		map[string]any{"type": "message", "role": "assistant", "content": "finished"},
+		map[string]any{"type": "message", "role": "user", "content": "next"},
+	)
+	plan, err := prepareCompaction(t, true, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := plan.Complete(compactionResponseBody(t, map[string]any{
+		"summary": "summary", "retain_item_ids": refsWithCallID(plan, callID),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var call, output bool
+	for _, message := range decodeResultPayload(t, result).Retained {
+		for _, c := range message.ToolCalls {
+			call = call || c.ID == callID
+		}
+		output = output || (message.Role == "tool" && message.ToolCallID == callID)
+	}
+	if !call || !output {
+		t.Fatalf("ordinary pair split: call=%v output=%v", call, output)
+	}
+}

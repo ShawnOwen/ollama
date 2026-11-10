@@ -714,8 +714,19 @@ func isPriorSummaryCallID(callID string) bool {
 }
 
 // priorSummaryRefs returns the refs of synthetic summary calls and outputs,
-// including outputs whose synthetic call is missing.
+// including outputs whose synthetic call is missing. An output whose call_id
+// belongs to an ordinary tool call is never treated as a summary.
 func priorSummaryRefs(items []CompactionTranscriptItem) map[string]struct{} {
+	ordinaryCallIDs := make(map[string]struct{})
+	for _, item := range items {
+		if item.Type != "function_call" {
+			continue
+		}
+		call := item.Message.ToolCalls[0]
+		if call.Function.Name != compactionSummaryToolName {
+			ordinaryCallIDs[call.ID] = struct{}{}
+		}
+	}
 	refs := make(map[string]struct{})
 	for _, item := range items {
 		switch item.Type {
@@ -725,7 +736,8 @@ func priorSummaryRefs(items []CompactionTranscriptItem) map[string]struct{} {
 				refs[item.Ref] = struct{}{}
 			}
 		case "function_call_output":
-			if isPriorSummaryCallID(item.Message.ToolCallID) {
+			callID := item.Message.ToolCallID
+			if _, ordinary := ordinaryCallIDs[callID]; !ordinary && isPriorSummaryCallID(callID) {
 				refs[item.Ref] = struct{}{}
 			}
 		}
